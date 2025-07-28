@@ -6,6 +6,8 @@ import gc
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
+from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -30,6 +32,16 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import (DPMetadata, get_forward_context,
                                   set_forward_context)
 from vllm.logger import init_logger
+
+# Add NVTX support
+try:
+    import nvtx
+    NVTX_AVAILABLE = True
+    print("NVTX available !!!!!")
+except ImportError:
+    NVTX_AVAILABLE = False
+    print("NVTX not available !!!!!")
+    
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaBase
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
@@ -86,6 +98,29 @@ else:
         "xgrammar.kernels.apply_token_bitmask_inplace_torch_compile")
 
 logger = init_logger(__name__)
+
+# Log NVTX availability warning if not available
+if not NVTX_AVAILABLE:
+    logger.warning("NVTX not available. Install with: pip install nvtx")
+
+
+@dataclass
+class InferenceIterStats:
+    """统计每个推理迭代的信息"""
+    iter_idx: int  # 迭代索引
+    context_reqs: int  # 当前迭代中context阶段请求数
+    decode_reqs: int   # 当前迭代中decode阶段请求数
+    context_tokens: int  # 当前迭代中context阶段token数
+    decode_tokens: int   # 当前迭代中decode阶段token数
+    total_tokens: int    # 当前迭代总token数
+    inference_time_ms: float  # 推理耗时（毫秒）
+    
+    def __str__(self):
+        return (f"[Iter {self.iter_idx}] "
+                f"Context: {self.context_reqs} reqs/{self.context_tokens} tokens, "
+                f"Decode: {self.decode_reqs} reqs/{self.decode_tokens} tokens, "
+                f"Total: {self.total_tokens} tokens, "
+                f"Time: {self.inference_time_ms:.2f}ms")
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -318,6 +353,197 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # means this layer will perform attention using the keys and values
         # from the KV cache of `shared_kv_cache_layers[layer_name]`.
         self.shared_kv_cache_layers: dict[str, str] = {}
+
+        # Initialize inference statistics tracking
+        self.inference_iter_count = 0
+        self.inference_stats_history: list[InferenceIterStats] = []
+        # 默认启用推理统计，可通过环境变量 VLLM_ENABLE_INFERENCE_STATS=0 关闭
+        self.enable_inference_stats = envs.VLLM_ENABLE_INFERENCE_STATS if hasattr(envs, 'VLLM_ENABLE_INFERENCE_STATS') else True
+        # 默认启用 NVTX（如果可用），可通过环境变量 VLLM_ENABLE_NVTX_PROFILING=0 关闭
+        self.enable_nvtx_profiling = NVTX_AVAILABLE and (
+            envs.VLLM_ENABLE_NVTX_PROFILING if hasattr(envs, 'VLLM_ENABLE_NVTX_PROFILING') else True
+        )
+        
+        if self.enable_inference_stats:
+            logger.info("Inference statistics tracking enabled")
+        if self.enable_nvtx_profiling:
+            logger.info("NVTX profiling enabled")
+
+    def _collect_current_iter_stats(self, scheduler_output: "SchedulerOutput") -> tuple[int, int, int, int]:
+        """
+        收集当前迭代的统计信息（只统计本次迭代处理的请求）
+        
+        返回: (context_reqs, decode_reqs, context_tokens, decode_tokens)
+        """
+        context_reqs = 0
+        decode_reqs = 0
+        context_tokens = 0
+        decode_tokens = 0
+        
+        # 获取新请求的ID集合
+        new_req_ids = {req.req_id for req in scheduler_output.scheduled_new_reqs}
+        #logger.info(f"new_req_ids: {new_req_ids}")
+        # 对于缓存的请求，构建一个映射：req_id -> num_computed_tokens（调度后的值）
+        cached_req_computed_tokens = {}
+        if scheduler_output.scheduled_cached_reqs.req_ids:
+            for i, req_id in enumerate(scheduler_output.scheduled_cached_reqs.req_ids):
+                cached_req_computed_tokens[req_id] = scheduler_output.scheduled_cached_reqs.num_computed_tokens[i]
+        #logger.info(f"cached_req_computed_tokens: {cached_req_computed_tokens}")
+        # 只统计本次迭代中实际被调度的请求
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            if num_tokens > 0:  # 只统计本次迭代实际处理的请求
+                if req_id in new_req_ids:
+                    # 新请求：检查其初始的num_computed_tokens
+                    # 如果是0，说明是全新的请求，这次是prefill
+                    # 如果不是0，说明是恢复的请求，需要进一步判断
+                    new_req = next(r for r in scheduler_output.scheduled_new_reqs if r.req_id == req_id)
+                    if new_req.num_computed_tokens == 0:
+                        # 全新请求的prefill
+                        #logger.info(f"new_req.num_computed_tokens: {new_req.num_computed_tokens}")
+                        context_reqs += 1
+                        context_tokens += num_tokens
+                    else:
+                        # 恢复的请求，检查是否还在prefill阶段
+                        prompt_len = len(new_req.prompt_token_ids)
+                        if new_req.num_computed_tokens < prompt_len:
+                            # 还在prefill阶段
+                            context_reqs += 1
+                            context_tokens += num_tokens
+                        else:
+                            # 已经完成prefill，在decode阶段
+                            decode_reqs += 1
+                            decode_tokens += num_tokens
+                elif req_id in cached_req_computed_tokens:
+                    # 缓存的请求：使用调度前的状态判断
+                    # 注意：cached_req_computed_tokens中的值是调度后的值
+                    # 所以需要减去本次处理的token数来得到调度前的值
+                    num_computed_before = cached_req_computed_tokens[req_id]
+                    
+                    # 获取请求的prompt长度
+                    if req_id in self.requests:
+                        prompt_len = len(self.requests[req_id].prompt_token_ids)
+                        
+                        # 如果调度前还没完成所有prompt tokens，说明这次是在做prefill
+                        
+                        if num_computed_before < prompt_len:
+                            context_reqs += 1
+                            context_tokens += num_tokens
+                        else:
+                            # 已经完成了prefill，这次是decode
+                            decode_reqs += 1
+                            decode_tokens += num_tokens
+                    else:
+                        # 异常情况：请求不在缓存中
+                        # 根据token数量判断
+                        if num_tokens > 1:
+                            context_reqs += 1
+                            context_tokens += num_tokens
+                        else:
+                            decode_reqs += 1
+                            decode_tokens += num_tokens
+                else:
+                    # 异常情况：请求既不是新的，也不在缓存请求中
+                    if num_tokens > 1:
+                        context_reqs += 1
+                        context_tokens += num_tokens
+                    else:
+                        decode_reqs += 1
+                        decode_tokens += num_tokens
+                
+        return context_reqs, decode_reqs, context_tokens, decode_tokens
+
+    def export_inference_stats(self, output_file: Optional[str] = None) -> str:
+        """
+        导出推理统计信息到文件或返回字符串
+        
+        Args:
+            output_file: 输出文件路径，如果为 None 则返回字符串
+            
+        Returns:
+            统计信息的字符串表示
+        """
+        if not self.inference_stats_history:
+            return "No inference statistics collected."
+        
+        stats_str = "=== Inference Iteration Statistics Summary ===\n\n"
+        
+        # 计算总体统计
+        total_iters = len(self.inference_stats_history)
+        total_context_reqs = sum(s.context_reqs for s in self.inference_stats_history)
+        total_decode_reqs = sum(s.decode_reqs for s in self.inference_stats_history)
+        total_context_tokens = sum(s.context_tokens for s in self.inference_stats_history)
+        total_decode_tokens = sum(s.decode_tokens for s in self.inference_stats_history)
+        total_tokens = sum(s.total_tokens for s in self.inference_stats_history)
+        total_time_ms = sum(s.inference_time_ms for s in self.inference_stats_history)
+        
+        stats_str += f"Total Iterations: {total_iters}\n"
+        stats_str += f"Total Time: {total_time_ms:.2f}ms ({total_time_ms/1000:.3f}s)\n"
+        stats_str += f"Average Time per Iteration: {total_time_ms/total_iters:.2f}ms\n\n"
+        
+        stats_str += f"Total Context Requests: {total_context_reqs}\n"
+        stats_str += f"Total Decode Requests: {total_decode_reqs}\n"
+        stats_str += f"Total Context Tokens: {total_context_tokens}\n"
+        stats_str += f"Total Decode Tokens: {total_decode_tokens}\n"
+        stats_str += f"Total Tokens: {total_tokens}\n\n"
+        
+        if total_time_ms > 0:
+            total_time_s = total_time_ms / 1000
+            stats_str += f"Overall Throughput: {total_tokens/total_time_s:.2f} tokens/s\n"
+            if total_context_tokens > 0:
+                stats_str += f"Context Throughput: {total_context_tokens/total_time_s:.2f} tokens/s\n"
+            if total_decode_tokens > 0:
+                stats_str += f"Decode Throughput: {total_decode_tokens/total_time_s:.2f} tokens/s\n"
+        
+        stats_str += "\n=== Per-Iteration Statistics ===\n\n"
+        for stat in self.inference_stats_history:
+            stats_str += str(stat) + "\n"
+        
+        if output_file:
+            with open(output_file, 'w') as f:
+                f.write(stats_str)
+            logger.info(f"Inference statistics exported to {output_file}")
+        
+        return stats_str
+
+    def get_recent_iter_stats(self, num_iters: int = 10) -> str:
+        """
+        获取最近几次迭代的统计信息
+        
+        Args:
+            num_iters: 要获取的迭代数量，默认10
+            
+        Returns:
+            最近迭代的统计信息字符串
+        """
+        if not self.inference_stats_history:
+            return "No inference statistics collected."
+        
+        recent_stats = self.inference_stats_history[-num_iters:]
+        stats_str = f"=== Recent {len(recent_stats)} Iterations ===\n\n"
+        
+        for stat in recent_stats:
+            stats_str += str(stat) + "\n"
+            
+        # 计算最近迭代的平均值
+        if len(recent_stats) > 0:
+            avg_context_reqs = sum(s.context_reqs for s in recent_stats) / len(recent_stats)
+            avg_decode_reqs = sum(s.decode_reqs for s in recent_stats) / len(recent_stats)
+            avg_context_tokens = sum(s.context_tokens for s in recent_stats) / len(recent_stats)
+            avg_decode_tokens = sum(s.decode_tokens for s in recent_stats) / len(recent_stats)
+            avg_total_tokens = sum(s.total_tokens for s in recent_stats) / len(recent_stats)
+            avg_time_ms = sum(s.inference_time_ms for s in recent_stats) / len(recent_stats)
+            
+            stats_str += f"\n=== Average of Recent {len(recent_stats)} Iterations ===\n"
+            stats_str += f"Avg Context: {avg_context_reqs:.1f} reqs, {avg_context_tokens:.1f} tokens\n"
+            stats_str += f"Avg Decode: {avg_decode_reqs:.1f} reqs, {avg_decode_tokens:.1f} tokens\n"
+            stats_str += f"Avg Total: {avg_total_tokens:.1f} tokens\n"
+            stats_str += f"Avg Time: {avg_time_ms:.2f}ms\n"
+            
+            if avg_time_ms > 0:
+                avg_throughput = avg_total_tokens / (avg_time_ms / 1000)
+                stats_str += f"Avg Throughput: {avg_throughput:.2f} tokens/s\n"
+        
+        return stats_str
 
     def _may_reorder_batch(self, scheduler_output: "SchedulerOutput") -> None:
         """
@@ -1351,19 +1577,55 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        # 开始推理计时
+        inference_start_time = time.time()
+        prepare_time_ms = 0.0  # 初始化准备阶段耗时
+        model_time_ms = 0.0    # 初始化模型前向传播耗时
+        
+        # 收集当前迭代的统计信息
+        if self.enable_inference_stats:
+            context_reqs, decode_reqs, context_tokens, decode_tokens = \
+                self._collect_current_iter_stats(scheduler_output)
+            total_tokens = scheduler_output.total_num_scheduled_tokens
+        
+        # NVTX 标记开始
+        if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+            # 初始标记，稍后会更新包含统计信息
+            nvtx_range = nvtx.start_range(
+                f"iter_{self.inference_iter_count},ctx={context_reqs}reqs/{context_tokens}toks,dec={decode_reqs}reqs/{decode_tokens}toks,total={total_tokens}toks",
+                color="green"
+            )
+        
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
                 # Return empty ModelRunnerOutput if there's no work to do.
+                if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+                    nvtx.end_range(nvtx_range)
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
-            return self.kv_connector_no_forward(scheduler_output)
+            result = self.kv_connector_no_forward(scheduler_output)
+            if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+                nvtx.end_range(nvtx_range)
+            return result
 
         # Prepare the decoder inputs.
+        # NVTX 标记输入准备阶段
+        if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+            nvtx_prepare_range = nvtx.start_range("prepare_inputs", color="yellow")
+            
         (attn_metadata, attention_cuda_graphs, logits_indices,
          spec_decode_metadata, num_scheduled_tokens_np,
          spec_decode_common_attn_metadata) = (
              self._prepare_inputs(scheduler_output))
+             
+        if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+            prepare_time_ms = (time.time() - inference_start_time) * 1000
+            nvtx.end_range(nvtx_prepare_range)
+            # 添加准备阶段的统计标记
+            num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if (self.use_cuda_graph
                 and num_scheduled_tokens <= self.cudagraph_batch_sizes[-1]):
@@ -1447,6 +1709,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
+            # NVTX 标记模型前向传播
+            if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+                nvtx_model_range = nvtx.start_range("model_forward", color="blue")
+            
             model_output = self.model(
                 input_ids=input_ids,
                 positions=positions,
@@ -1457,6 +1723,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     device=self.device,
                 ),
             )
+            
+            if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+                # this is only for timing, not for profiling!!!!!!!!!!!!!!!!!!!
+                if self.enable_inference_stats:
+                    torch.cuda.synchronize()
+                model_time_ms = (time.perf_counter() - inference_start_time) * 1000 - prepare_time_ms
+                nvtx.end_range(nvtx_model_range)
+                # 添加模型前向传播的统计标记
 
             self.maybe_wait_for_kv_save()
             finished_sending, finished_recving = (
@@ -1508,7 +1782,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.apply_grammar_bitmask(scheduler_output, logits)
 
         # Sample the next token and get logprobs if needed.
+        # NVTX 标记采样阶段
+        if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+            nvtx_sample_range = nvtx.start_range("sampling", color="red")
+            
         sampling_metadata = self.input_batch.sampling_metadata
+        
+        # 标记实际的采样操作
+ 
+            
         if spec_decode_metadata is None:
             sampler_output = self.sampler(
                 logits=logits,
@@ -1539,6 +1821,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 sampling_metadata,
             )
             sampler_output.sampled_token_ids = output_token_ids
+            
+
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1564,11 +1848,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # NOTE: GPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
+
+            
         logprobs_tensors = sampler_output.logprobs_tensors
         logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
 
+
         # Compute prompt logprobs if needed.
+            
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output,
@@ -1614,6 +1902,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 
+
         if not self.speculative_config:
             # Speculative decoding is not enabled.
             spec_token_ids = None
@@ -1631,6 +1920,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
 
         self.eplb_step()
+
+        # end all nvtx ranges
+        if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+            sample_time_ms = (time.time() - inference_start_time) * 1000 - prepare_time_ms - model_time_ms
+            nvtx.end_range(nvtx_sample_range)
+            # 添加采样阶段的统计标记
+           
+        # 记录当前迭代的统计信息
+        if self.enable_inference_stats:
+            inference_time_ms = (time.time() - inference_start_time) * 1000  # 转换为毫秒
+            stats = InferenceIterStats(
+                iter_idx=self.inference_iter_count,
+                context_reqs=context_reqs,
+                decode_reqs=decode_reqs,
+                context_tokens=context_tokens,
+                decode_tokens=decode_tokens,
+                total_tokens=total_tokens,
+                inference_time_ms=inference_time_ms
+            )
+            self.inference_stats_history.append(stats)
+            
+            # 打印当前迭代的统计信息
+            logger.info(str(stats))
+        
+        # 结束 NVTX 标记，添加统计信息
+        if self.enable_nvtx_profiling and NVTX_AVAILABLE:
+            # 创建包含统计信息的标记名称（使用当前的迭代计数）
+            if self.enable_inference_stats:
+                nvtx_label = (
+                    f"iter_{self.inference_iter_count}: "
+                    f"ctx={context_reqs}reqs/{context_tokens}toks, "
+                    f"dec={decode_reqs}reqs/{decode_tokens}toks, "
+                    f"total={total_tokens}toks, "
+                    f"time={inference_time_ms:.1f}ms"
+                )
+            else:
+                # 如果统计未启用，仍然提供基本信息
+                nvtx_label = f"iter_{self.inference_iter_count}"
+            # 更新 NVTX 范围的名称（如果支持）
+            # 注意：标准 NVTX API 不支持动态更新范围名称，所以我们结束旧范围并创建一个新的
+            nvtx.end_range(nvtx_range)
+            # 立即创建一个带有完整信息的标记
+           
+            
+        # 增加迭代计数（在使用后增加）
+        if self.enable_inference_stats:
+            self.inference_iter_count += 1
 
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
